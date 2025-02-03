@@ -9,14 +9,14 @@ enum Region {
 }
 
 fn main() {
-    let mut buf = Vec::new();
+    let mut nsf_rom = Vec::new();
     File::open("./mm2.nsf")
         .unwrap()
-        .read_to_end(&mut buf)
+        .read_to_end(&mut nsf_rom)
         .unwrap();
     let mut i = 0;
-    i += expect_bytes(&buf[i..], b"NESM\x1A");
-    let version_number = buf[i];
+    i += expect_bytes(&nsf_rom[i..], b"NESM\x1A");
+    let version_number = nsf_rom[i];
     if ![1, 2].contains(&version_number) {
         panic!("expected version 1 or 2, got {}", version_number);
     }
@@ -25,32 +25,32 @@ fn main() {
     }
     i += 1;
 
-    let total_num_songs = grab_u8(&buf, &mut i);
+    let total_num_songs = grab_u8(&nsf_rom, &mut i);
     // note: this is one indexed
-    let starting_song = grab_u8(&buf, &mut i);
+    let starting_song = grab_u8(&nsf_rom, &mut i);
 
-    let load_addr = grab_u16(&buf, &mut i);
-    let init_addr = grab_u16(&buf, &mut i);
-    let play_addr = grab_u16(&buf, &mut i);
+    let load_addr = grab_u16(&nsf_rom, &mut i);
+    let init_addr = grab_u16(&nsf_rom, &mut i);
+    let play_addr = grab_u16(&nsf_rom, &mut i);
 
-    let song_name = CStr::from_bytes_until_nul(grab_n_bytes(&buf, &mut i, 32))
+    let song_name = CStr::from_bytes_until_nul(grab_n_bytes(&nsf_rom, &mut i, 32))
         .unwrap()
         .to_str()
         .unwrap();
-    let artist_name = CStr::from_bytes_until_nul(grab_n_bytes(&buf, &mut i, 32))
+    let artist_name = CStr::from_bytes_until_nul(grab_n_bytes(&nsf_rom, &mut i, 32))
         .unwrap()
         .to_str()
         .unwrap();
-    let copyright_holder = CStr::from_bytes_until_nul(grab_n_bytes(&buf, &mut i, 32))
+    let copyright_holder = CStr::from_bytes_until_nul(grab_n_bytes(&nsf_rom, &mut i, 32))
         .unwrap()
         .to_str()
         .unwrap();
 
-    let play_speed_ticks_ntsc = grab_u16(&buf, &mut i);
-    let bankswitch_init_values = grab_n_bytes(&buf, &mut i, 8);
-    let play_speed_ticks_pal = grab_u16(&buf, &mut i);
+    let play_speed_ticks_ntsc = grab_u16(&nsf_rom, &mut i);
+    let bankswitch_init_values = grab_n_bytes(&nsf_rom, &mut i, 8);
+    let play_speed_ticks_pal = grab_u16(&nsf_rom, &mut i);
 
-    let pal_ntsc_flags = grab_u8(&buf, &mut i);
+    let pal_ntsc_flags = grab_u8(&nsf_rom, &mut i);
     let region = match pal_ntsc_flags & 0x00 {
         0 => Region::NTSC,
         1 => Region::PAL,
@@ -60,17 +60,17 @@ fn main() {
     assert_eq!(0, 0b11111100 & pal_ntsc_flags);
 
     assert_eq!(0x7b, i);
-    let extra_sound_chip_support = grab_u8(&buf, &mut i);
+    let extra_sound_chip_support = grab_u8(&nsf_rom, &mut i);
     assert_eq!(
         0, extra_sound_chip_support,
         "no external sound chips support yet"
     );
 
     // reserved for nsf2
-    i += expect_bytes(&buf[i..], &[0]);
+    i += expect_bytes(&nsf_rom[i..], &[0]);
 
     // 24 bit length also reserved for nsf2
-    i += expect_bytes(&buf[i..], &[0, 0, 0]);
+    i += expect_bytes(&nsf_rom[i..], &[0, 0, 0]);
 
     assert_eq!(0x80, i);
 
@@ -95,17 +95,271 @@ fn main() {
     dbg!(region);
     dbg!(dual_pal_ntsc);
 
-    // start of cpu code
-    match &buf[i..] {
-        // jmp
-        &[0x4c, ..] => {
-            i += 1;
-            let addr = grab_u16(&buf, &mut i);
-            panic!("unhandled jmp to {:x}", addr);
+    // copy the NSF rom into memory
+    let mut memory = vec![0; 65536];
+    let rest_of_rom = &nsf_rom[i..];
+
+    // start emulating CPU and doing playback
+    memory[load_addr as usize..(load_addr as usize) + rest_of_rom.len()]
+        .copy_from_slice(&nsf_rom[i..]);
+    let mut pc = init_addr as u16;
+    let mut a = 0;
+    let mut carry = false;
+    let mut zero = false;
+    let mut negative = false;
+    let mut overflow = false;
+    let mut x = 0;
+    let mut y = 0;
+    let mut sp = 0xff;
+    loop {
+        match &memory[pc as usize..] {
+            // pha: push a to stack
+            &[0x48, ..] => {
+                push_u8(&mut memory, &mut sp, a);
+                pc += 1;
+            }
+
+            // pla: pull a from stack
+            &[0x68, ..] => {
+                a = pop_u8(&mut memory, &mut sp);
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // jsr: jump to subroutine
+            &[0x20, lo, hi, ..] => {
+                let addr = u16::from_le_bytes([lo, hi]);
+                push_u16(&mut memory, &mut sp, pc + 2);
+                pc = addr;
+            }
+
+            // rts: return from subroutine
+            &[0x60, ..] => {
+                pc = pop_u16(&mut memory, &mut sp) + 1;
+            }
+
+            // lda: load a
+            // immediate
+            &[0xa9, val, ..] => {
+                a = val;
+                pc += 2;
+            }
+            // zero page
+            &[0xa5, addr, ..] => {
+                a = memory[addr as usize];
+                pc += 2;
+            }
+            // absolute +x
+            &[0xbd, lo, hi, ..] => {
+                let addr = u16::from_le_bytes([lo, hi]);
+                a = memory[(addr + x as u16) as usize];
+                pc += 3;
+            }
+            // indirect +y
+            &[0xb1, addr, ..] => {
+                let addr = u16::from_le_bytes([
+                    memory[addr as usize],
+                    memory[addr.wrapping_add(1) as usize],
+                ]);
+                a = memory[(addr + y as u16) as usize];
+                pc += 2;
+            }
+
+            // sta: store a
+            // absolute
+            &[0x85, lo, ..] => {
+                memory[lo as usize] = a;
+                pc += 2;
+            }
+            // absolute
+            &[0x8d, lo, hi, ..] => {
+                let addr = u16::from_le_bytes([lo, hi]);
+                memory[addr as usize] = a;
+                pc += 3;
+            }
+            // absolute +x
+            &[0x9d, lo, hi, ..] => {
+                let addr = u16::from_le_bytes([lo, hi]);
+                memory[(addr + x as u16) as usize] = a;
+                pc += 3;
+            }
+
+            // ldx: load x
+            // zero page
+            &[0xa6, addr, ..] => {
+                x = memory[addr as usize];
+                pc += 2;
+            }
+
+            // tax: transfer a to x
+            &[0xaa, ..] => {
+                x = a;
+                zero = x == 0;
+                negative = x & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // ldy: load y
+            // immediate
+            &[0xa0, val, ..] => {
+                y = val;
+                zero = y == 0;
+                negative = y & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // jmp
+            // absolute
+            &[0x4c, lo, hi, ..] => {
+                pc = u16::from_le_bytes([lo, hi]);
+            }
+
+            // beq: branch if equal
+            &[0xf0, offset, ..] => {
+                if zero {
+                    let offset = i8::from_le_bytes([offset]);
+                    pc = pc.wrapping_add_signed(2 + offset as i16);
+                } else {
+                    pc += 2;
+                }
+            }
+
+            // bne: branch if not equal
+            &[0xd0, offset, ..] => {
+                if !zero {
+                    let offset = i8::from_le_bytes([offset]);
+                    pc = pc.wrapping_add_signed(2 + offset as i16);
+                } else {
+                    pc += 2;
+                }
+            }
+
+            // bcc: branch if carry clear
+            &[0x90, offset, ..] => {
+                if !carry {
+                    let offset = i8::from_le_bytes([offset]);
+                    pc = pc.wrapping_add_signed(2 + offset as i16);
+                } else {
+                    pc += 2;
+                }
+            }
+
+            // cmp
+            // immediate
+            &[0xc9, val, ..] => {
+                carry = a >= val;
+                zero = a == val;
+                let result = a.wrapping_sub(val);
+                negative = result & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // dec: decrement memory
+            // zero page
+            &[0xc6, addr, ..] => {
+                memory[addr as usize] -= 1;
+                zero = memory[addr as usize] == 0;
+                negative = memory[addr as usize] & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // adc: add with carry
+            // zero page
+            &[0x65, addr, ..] => {
+                let value_to_add = memory[addr as usize] as u16;
+                let result = (a as u16) + value_to_add + carry as u16;
+
+                let a_prev = a;
+                a = result as u8;
+                carry = result > 0xFF;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                // "If the result's sign is different from both A's and memory's, signed overflow (or underflow) occurred."
+                overflow = ((a_prev ^ a) & (a_prev ^ value_to_add as u8) & 0x80) != 0;
+                pc += 2;
+            }
+
+            // lsr: logical shift right
+            // accumulator
+            &[0x4a, ..] => {
+                carry = a & 1 != 0;
+                a >>= 1;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // asl: arithmetic shift left
+            // accumulator
+            &[0x0a, ..] => {
+                carry = a & (1 << 7) != 0;
+                a <<= 1;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // zero page
+            &[0x46, addr, ..] => {
+                carry = memory[addr as usize] & 1 != 0;
+                memory[addr as usize] >>= 1;
+                zero = memory[addr as usize] == 0;
+                negative = memory[addr as usize] & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // and
+            // immediate
+            &[0x29, val, ..] => {
+                a &= val;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // clc: clear carry
+            &[0x18, ..] => {
+                carry = false;
+                pc += 1;
+            }
+
+            _ => panic!(
+                "unhandled cpu code: 0x{:02x} ({:?})",
+                &memory[pc as usize], &memory[pc as usize]
+            ),
         }
-        _ => panic!("unhandled cpu code: {:?}", &buf[i]),
     }
-    println!("{:x}", buf[i]);
+}
+
+fn pop_u16(memory: &mut [u8], sp: &mut u8) -> u16 {
+    *sp += 1;
+    let lo = memory[stack_addr(*sp) as usize];
+    *sp += 1;
+    let hi = memory[stack_addr(*sp) as usize];
+    u16::from_le_bytes([lo, hi])
+}
+
+fn push_u16(memory: &mut [u8], sp: &mut u8, val: u16) {
+    let [lo, hi] = val.to_le_bytes();
+    memory[stack_addr(*sp) as usize] = hi;
+    *sp -= 1;
+    memory[stack_addr(*sp) as usize] = lo;
+    *sp -= 1;
+}
+
+fn pop_u8(memory: &mut Vec<u8>, sp: &mut u8) -> u8 {
+    *sp += 1;
+    memory[stack_addr(*sp) as usize]
+}
+
+fn push_u8(memory: &mut Vec<u8>, sp: &mut u8, val: u8) {
+    memory[stack_addr(*sp) as usize] = val;
+    *sp -= 1;
+}
+
+fn stack_addr(sp: u8) -> u16 {
+    0x0100 + sp as u16
 }
 
 fn grab_u16(buf: &[u8], i: &mut usize) -> u16 {
