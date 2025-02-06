@@ -8,6 +8,14 @@ enum Region {
     PAL,
 }
 
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if true {
+            println!($($arg)*);
+        }
+    };
+}
+
 fn main() {
     let mut nsf_rom = Vec::new();
     File::open("./mm2.nsf")
@@ -111,16 +119,32 @@ fn main() {
     let mut x = 0;
     let mut y = 0;
     let mut sp = 0xff;
+
+    let mut is_done_with_init = false;
+    let mut is_init_just_finished = false;
+
     loop {
+        if is_init_just_finished {
+            debug!(
+                "init just finished, setting pc to play_addr (0x{:04x})",
+                play_addr
+            );
+            pc = play_addr;
+            is_done_with_init = true;
+            is_init_just_finished = false;
+        }
+
         match &memory[pc as usize..] {
             // pha: push a to stack
             &[0x48, ..] => {
+                debug!("pha: push a to stack");
                 push_u8(&mut memory, &mut sp, a);
                 pc += 1;
             }
 
             // pla: pull a from stack
             &[0x68, ..] => {
+                debug!("pla: pull a from stack");
                 a = pop_u8(&mut memory, &mut sp);
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
@@ -129,6 +153,7 @@ fn main() {
 
             // jsr: jump to subroutine
             &[0x20, lo, hi, ..] => {
+                debug!("jsr: jump to subroutine (0x{:02x}{:02x})", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
                 push_u16(&mut memory, &mut sp, pc + 2);
                 pc = addr;
@@ -136,28 +161,37 @@ fn main() {
 
             // rts: return from subroutine
             &[0x60, ..] => {
-                pc = pop_u16(&mut memory, &mut sp) + 1;
+                debug!("rts: return from subroutine");
+                if sp == 0xff {
+                    is_init_just_finished = true;
+                } else {
+                    pc = pop_u16(&mut memory, &mut sp) + 1;
+                }
             }
 
             // lda: load a
             // immediate
             &[0xa9, val, ..] => {
+                debug!("lda: load a (immediate) 0x{:02x}", val);
                 a = val;
                 pc += 2;
             }
             // zero page
             &[0xa5, addr, ..] => {
+                debug!("lda: load a (zero page) 0x{:02x}", addr);
                 a = memory[addr as usize];
                 pc += 2;
             }
             // absolute +x
             &[0xbd, lo, hi, ..] => {
+                debug!("lda: load a (absolute +x) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
                 a = memory[(addr + x as u16) as usize];
                 pc += 3;
             }
             // indirect +y
             &[0xb1, addr, ..] => {
+                debug!("lda: load a (indirect +y) 0x{:02x}", addr);
                 let addr = u16::from_le_bytes([
                     memory[addr as usize],
                     memory[addr.wrapping_add(1) as usize],
@@ -169,17 +203,20 @@ fn main() {
             // sta: store a
             // absolute
             &[0x85, lo, ..] => {
+                debug!("sta: store a (absolute) 0x{:02x}", lo);
                 memory[lo as usize] = a;
                 pc += 2;
             }
             // absolute
             &[0x8d, lo, hi, ..] => {
+                debug!("sta: store a (absolute) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
                 memory[addr as usize] = a;
                 pc += 3;
             }
             // absolute +x
             &[0x9d, lo, hi, ..] => {
+                debug!("sta: store a (absolute +x) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
                 memory[(addr + x as u16) as usize] = a;
                 pc += 3;
@@ -188,12 +225,22 @@ fn main() {
             // ldx: load x
             // zero page
             &[0xa6, addr, ..] => {
+                debug!("ldx: load x (zero page) 0x{:02x}", addr);
                 x = memory[addr as usize];
+                pc += 2;
+            }
+
+            // stx: store x
+            // zero page
+            &[0x86, addr, ..] => {
+                debug!("stx: store x (zero page) 0x{:02x}", addr);
+                memory[addr as usize] = x;
                 pc += 2;
             }
 
             // tax: transfer a to x
             &[0xaa, ..] => {
+                debug!("tax: transfer a to x");
                 x = a;
                 zero = x == 0;
                 negative = x & (1 << 7) != 0;
@@ -203,6 +250,7 @@ fn main() {
             // ldy: load y
             // immediate
             &[0xa0, val, ..] => {
+                debug!("ldy: load y (immediate) 0x{:02x}", val);
                 y = val;
                 zero = y == 0;
                 negative = y & (1 << 7) != 0;
@@ -212,11 +260,13 @@ fn main() {
             // jmp
             // absolute
             &[0x4c, lo, hi, ..] => {
+                debug!("jmp: jump to 0x{:02x}{:02x}", hi, lo);
                 pc = u16::from_le_bytes([lo, hi]);
             }
 
             // beq: branch if equal
             &[0xf0, offset, ..] => {
+                debug!("beq: branch if equal");
                 if zero {
                     let offset = i8::from_le_bytes([offset]);
                     pc = pc.wrapping_add_signed(2 + offset as i16);
@@ -227,6 +277,7 @@ fn main() {
 
             // bne: branch if not equal
             &[0xd0, offset, ..] => {
+                debug!("bne: branch if not equal");
                 if !zero {
                     let offset = i8::from_le_bytes([offset]);
                     pc = pc.wrapping_add_signed(2 + offset as i16);
@@ -237,7 +288,19 @@ fn main() {
 
             // bcc: branch if carry clear
             &[0x90, offset, ..] => {
+                debug!("bcc: branch if carry clear");
                 if !carry {
+                    let offset = i8::from_le_bytes([offset]);
+                    pc = pc.wrapping_add_signed(2 + offset as i16);
+                } else {
+                    pc += 2;
+                }
+            }
+
+            // bcs: branch if carry set
+            &[0xb0, offset, ..] => {
+                debug!("bcs: branch if carry set");
+                if carry {
                     let offset = i8::from_le_bytes([offset]);
                     pc = pc.wrapping_add_signed(2 + offset as i16);
                 } else {
@@ -248,6 +311,7 @@ fn main() {
             // cmp
             // immediate
             &[0xc9, val, ..] => {
+                debug!("cmp: compare (immediate) 0x{:02x}", val);
                 carry = a >= val;
                 zero = a == val;
                 let result = a.wrapping_sub(val);
@@ -255,18 +319,69 @@ fn main() {
                 pc += 2;
             }
 
+            // cpx
+            // zero page
+            &[0xe4, addr, ..] => {
+                debug!("cpx: compare x (zero page) 0x{:02x}", addr);
+                carry = x >= memory[addr as usize];
+                zero = x == memory[addr as usize];
+                let result = x.wrapping_sub(memory[addr as usize]);
+                negative = result & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // cpy
+            // immediate
+            &[0xc0, val, ..] => {
+                debug!("cpy: compare y (immediate) 0x{:02x}", val);
+                carry = y >= val;
+                zero = y == val;
+                let result = y.wrapping_sub(val);
+                negative = result & (1 << 7) != 0;
+                pc += 2;
+            }
+
             // dec: decrement memory
             // zero page
             &[0xc6, addr, ..] => {
+                debug!("dec: decrement memory (zero page) 0x{:02x}", addr);
                 memory[addr as usize] -= 1;
                 zero = memory[addr as usize] == 0;
                 negative = memory[addr as usize] & (1 << 7) != 0;
                 pc += 2;
             }
 
+            // dey: decrement y
+            &[0x88, ..] => {
+                debug!("dey: decrement y");
+                y = y.wrapping_sub(1);
+                zero = y == 0;
+                negative = y & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // inx: increment x
+            &[0xe8, ..] => {
+                debug!("inx: increment x");
+                x = x.wrapping_add(1);
+                zero = x == 0;
+                negative = x & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // iny: increment y
+            &[0xc8, ..] => {
+                debug!("iny: increment y");
+                y = y.wrapping_add(1);
+                zero = y == 0;
+                negative = y & (1 << 7) != 0;
+                pc += 1;
+            }
+
             // adc: add with carry
             // zero page
             &[0x65, addr, ..] => {
+                debug!("adc: add with carry (zero page) 0x{:02x}", addr);
                 let value_to_add = memory[addr as usize] as u16;
                 let result = (a as u16) + value_to_add + carry as u16;
 
@@ -283,6 +398,7 @@ fn main() {
             // lsr: logical shift right
             // accumulator
             &[0x4a, ..] => {
+                debug!("lsr: logical shift right (accumulator)");
                 carry = a & 1 != 0;
                 a >>= 1;
                 zero = a == 0;
@@ -293,6 +409,7 @@ fn main() {
             // asl: arithmetic shift left
             // accumulator
             &[0x0a, ..] => {
+                debug!("asl: arithmetic shift left (accumulator)");
                 carry = a & (1 << 7) != 0;
                 a <<= 1;
                 zero = a == 0;
@@ -302,6 +419,7 @@ fn main() {
 
             // zero page
             &[0x46, addr, ..] => {
+                debug!("lsr: logical shift right (zero page) 0x{:02x}", addr);
                 carry = memory[addr as usize] & 1 != 0;
                 memory[addr as usize] >>= 1;
                 zero = memory[addr as usize] == 0;
@@ -312,7 +430,18 @@ fn main() {
             // and
             // immediate
             &[0x29, val, ..] => {
+                debug!("and: and (immediate) 0x{:02x}", val);
                 a &= val;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // ora: or with accumulator
+            // zero page
+            &[0x05, addr, ..] => {
+                debug!("ora: or with accumulator (zero page) 0x{:02x}", addr);
+                a |= memory[addr as usize];
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
                 pc += 2;
@@ -320,7 +449,14 @@ fn main() {
 
             // clc: clear carry
             &[0x18, ..] => {
+                debug!("clc: clear carry");
                 carry = false;
+                pc += 1;
+            }
+
+            // nop: no-op
+            &[0xea, ..] => {
+                debug!("nop: no-op");
                 pc += 1;
             }
 
