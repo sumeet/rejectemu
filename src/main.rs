@@ -265,6 +265,13 @@ fn main() {
                 a = memory[addr as u16];
                 pc += 2;
             }
+            // absolute
+            &[0xad, lo, hi, ..] => {
+                debug!("lda: load a (absolute) 0x{:02x}{:02x}", hi, lo);
+                let addr = u16::from_le_bytes([lo, hi]);
+                a = memory[addr];
+                pc += 3;
+            }
             // absolute +x
             &[0xbd, lo, hi, ..] => {
                 debug!("lda: load a (absolute +x) 0x{:02x}{:02x}", hi, lo);
@@ -302,8 +309,24 @@ fn main() {
                 memory.set(addr + x as u16, a);
                 pc += 3;
             }
+            // indirect +y
+            &[0x91, addr, ..] => {
+                debug!("sta: store a (indirect +y) 0x{:02x}", addr);
+                let addr =
+                    u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
+                memory.set(addr + y as u16, a);
+                pc += 2;
+            }
 
             // ldx: load x
+            // immediate
+            &[0xa2, val, ..] => {
+                debug!("ldx: load x (immediate) 0x{:02x}", val);
+                x = val;
+                zero = x == 0;
+                negative = x & (1 << 7) != 0;
+                pc += 2;
+            }
             // zero page
             &[0xa6, addr, ..] => {
                 debug!("ldx: load x (zero page) 0x{:02x}", addr);
@@ -335,6 +358,14 @@ fn main() {
                 y = val;
                 zero = y == 0;
                 negative = y & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // sty: store y
+            // zero page
+            &[0x84, addr, ..] => {
+                debug!("sty: store y (zero page) 0x{:02x}", addr);
+                memory.set(addr as u16, y);
                 pc += 2;
             }
 
@@ -441,6 +472,16 @@ fn main() {
                 pc += 1;
             }
 
+            // inc: increment memory
+            // zero page
+            &[0xe6, addr, ..] => {
+                debug!("inc: increment memory (zero page) 0x{:02x}", addr);
+                memory.set(addr as u16, memory[addr as u16].wrapping_add(1));
+                zero = memory[addr as u16] == 0;
+                negative = memory[addr as u16] & (1 << 7) != 0;
+                pc += 2;
+            }
+
             // inx: increment x
             &[0xe8, ..] => {
                 debug!("inx: increment x");
@@ -464,6 +505,23 @@ fn main() {
             &[0x65, addr, ..] => {
                 debug!("adc: add with carry (zero page) 0x{:02x}", addr);
                 let value_to_add = memory[addr as u16] as u16;
+                let result = (a as u16) + value_to_add + carry as u16;
+
+                let a_prev = a;
+                a = result as u8;
+                carry = result > 0xFF;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                // "If the result's sign is different from both A's and memory's, signed overflow (or underflow) occurred."
+                overflow = ((a_prev ^ a) & (a_prev ^ value_to_add as u8) & 0x80) != 0;
+                pc += 2;
+            }
+            // indirect +y
+            &[0x71, addr, ..] => {
+                debug!("adc: add with carry (indirect +y) 0x{:02x}", addr);
+                let addr =
+                    u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
+                let value_to_add = memory[addr + y as u16] as u16;
                 let result = (a as u16) + value_to_add + carry as u16;
 
                 let a_prev = a;
