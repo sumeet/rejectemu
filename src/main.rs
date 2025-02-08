@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::Read;
+use std::ops::{Index, RangeFrom};
 
 #[derive(Debug)]
 enum Region {
@@ -14,6 +15,87 @@ macro_rules! debug {
             println!($($arg)*);
         }
     };
+}
+
+struct MappedMemory {
+    memory: [u8; 65536],
+}
+
+impl MappedMemory {
+    fn new() -> Self {
+        Self { memory: [0; 65536] }
+    }
+
+    fn get(&self, index: u16) -> &u8 {
+        // APU ranges
+        // $4000–$4013, $4015–$4017
+
+        let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
+        for apu_range in apu_ranges {
+            if apu_range.contains(&index) {
+                panic!("APU range read: 0x{:04x}", index);
+            }
+        }
+
+        &self.memory[index as usize]
+    }
+
+    fn get_range(&self, index: std::ops::Range<u16>) -> &[u8] {
+        let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
+        for apu_range in apu_ranges {
+            if apu_range.contains(&index.start) || apu_range.contains(&index.end) {
+                panic!("APU range read: 0x{:04x}..0x{:04x}", index.start, index.end);
+            }
+        }
+
+        &self.memory[index.start as usize..index.end as usize]
+    }
+
+    fn get_range_from(&self, index: RangeFrom<u16>) -> &[u8] {
+        let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
+        for apu_range in apu_ranges {
+            if apu_range.contains(&index.start) {
+                panic!("APU range read: 0x{:04x}..", index.start);
+            }
+        }
+
+        &self.memory[index.start as usize..]
+    }
+
+    fn set(&mut self, index: u16, value: u8) {
+        let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
+        for apu_range in apu_ranges {
+            if apu_range.contains(&index) {
+                panic!("APU range write: 0x{:04x} = 0x{:02x}", index, value);
+            }
+        }
+
+        self.memory[index as usize] = value;
+    }
+}
+
+impl Index<u16> for MappedMemory {
+    type Output = u8;
+
+    fn index(&self, index: u16) -> &Self::Output {
+        self.get(index)
+    }
+}
+
+impl Index<std::ops::Range<u16>> for MappedMemory {
+    type Output = [u8];
+
+    fn index(&self, index: std::ops::Range<u16>) -> &Self::Output {
+        self.get_range(index)
+    }
+}
+
+impl Index<RangeFrom<u16>> for MappedMemory {
+    type Output = [u8];
+
+    fn index(&self, index: RangeFrom<u16>) -> &Self::Output {
+        self.get_range_from(index)
+    }
 }
 
 fn main() {
@@ -104,11 +186,12 @@ fn main() {
     dbg!(dual_pal_ntsc);
 
     // copy the NSF rom into memory
-    let mut memory = vec![0; 65536];
+    // let mut memory = [0; 65536];
+    let mut memory = MappedMemory::new();
     let rest_of_rom = &nsf_rom[i..];
 
     // start emulating CPU and doing playback
-    memory[load_addr as usize..(load_addr as usize) + rest_of_rom.len()]
+    memory.memory[load_addr as usize..(load_addr as usize) + rest_of_rom.len()]
         .copy_from_slice(&nsf_rom[i..]);
     let mut pc = init_addr as u16;
     let mut a = 0;
@@ -134,18 +217,18 @@ fn main() {
             is_init_just_finished = false;
         }
 
-        match &memory[pc as usize..] {
+        match &memory[pc..] {
             // pha: push a to stack
             &[0x48, ..] => {
                 debug!("pha: push a to stack");
-                push_u8(&mut memory, &mut sp, a);
+                push_u8(&mut memory.memory, &mut sp, a);
                 pc += 1;
             }
 
             // pla: pull a from stack
             &[0x68, ..] => {
                 debug!("pla: pull a from stack");
-                a = pop_u8(&mut memory, &mut sp);
+                a = pop_u8(&mut memory.memory, &mut sp);
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
                 pc += 1;
@@ -155,7 +238,7 @@ fn main() {
             &[0x20, lo, hi, ..] => {
                 debug!("jsr: jump to subroutine (0x{:02x}{:02x})", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
-                push_u16(&mut memory, &mut sp, pc + 2);
+                push_u16(&mut memory.memory, &mut sp, pc + 2);
                 pc = addr;
             }
 
@@ -165,7 +248,7 @@ fn main() {
                 if sp == 0xff {
                     is_init_just_finished = true;
                 } else {
-                    pc = pop_u16(&mut memory, &mut sp) + 1;
+                    pc = pop_u16(&mut memory.memory, &mut sp) + 1;
                 }
             }
 
@@ -179,24 +262,22 @@ fn main() {
             // zero page
             &[0xa5, addr, ..] => {
                 debug!("lda: load a (zero page) 0x{:02x}", addr);
-                a = memory[addr as usize];
+                a = memory[addr as u16];
                 pc += 2;
             }
             // absolute +x
             &[0xbd, lo, hi, ..] => {
                 debug!("lda: load a (absolute +x) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
-                a = memory[(addr + x as u16) as usize];
+                a = memory[(addr + x as u16)];
                 pc += 3;
             }
             // indirect +y
             &[0xb1, addr, ..] => {
                 debug!("lda: load a (indirect +y) 0x{:02x}", addr);
-                let addr = u16::from_le_bytes([
-                    memory[addr as usize],
-                    memory[addr.wrapping_add(1) as usize],
-                ]);
-                a = memory[(addr + y as u16) as usize];
+                let addr =
+                    u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
+                a = memory[addr + y as u16];
                 pc += 2;
             }
 
@@ -204,21 +285,21 @@ fn main() {
             // absolute
             &[0x85, lo, ..] => {
                 debug!("sta: store a (absolute) 0x{:02x}", lo);
-                memory[lo as usize] = a;
+                memory.set(lo as u16, a);
                 pc += 2;
             }
             // absolute
             &[0x8d, lo, hi, ..] => {
                 debug!("sta: store a (absolute) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
-                memory[addr as usize] = a;
+                memory.set(addr, a);
                 pc += 3;
             }
             // absolute +x
             &[0x9d, lo, hi, ..] => {
                 debug!("sta: store a (absolute +x) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
-                memory[(addr + x as u16) as usize] = a;
+                memory.set(addr + x as u16, a);
                 pc += 3;
             }
 
@@ -226,7 +307,7 @@ fn main() {
             // zero page
             &[0xa6, addr, ..] => {
                 debug!("ldx: load x (zero page) 0x{:02x}", addr);
-                x = memory[addr as usize];
+                x = memory[addr as u16];
                 pc += 2;
             }
 
@@ -234,7 +315,7 @@ fn main() {
             // zero page
             &[0x86, addr, ..] => {
                 debug!("stx: store x (zero page) 0x{:02x}", addr);
-                memory[addr as usize] = x;
+                memory.set(addr as u16, x);
                 pc += 2;
             }
 
@@ -323,9 +404,9 @@ fn main() {
             // zero page
             &[0xe4, addr, ..] => {
                 debug!("cpx: compare x (zero page) 0x{:02x}", addr);
-                carry = x >= memory[addr as usize];
-                zero = x == memory[addr as usize];
-                let result = x.wrapping_sub(memory[addr as usize]);
+                carry = x >= memory[addr as u16];
+                zero = x == memory[addr as u16];
+                let result = x.wrapping_sub(memory[addr as u16]);
                 negative = result & (1 << 7) != 0;
                 pc += 2;
             }
@@ -345,9 +426,9 @@ fn main() {
             // zero page
             &[0xc6, addr, ..] => {
                 debug!("dec: decrement memory (zero page) 0x{:02x}", addr);
-                memory[addr as usize] -= 1;
-                zero = memory[addr as usize] == 0;
-                negative = memory[addr as usize] & (1 << 7) != 0;
+                memory.set(addr as u16, memory[addr as u16].wrapping_sub(1));
+                zero = memory[addr as u16] == 0;
+                negative = memory[addr as u16] & (1 << 7) != 0;
                 pc += 2;
             }
 
@@ -382,7 +463,7 @@ fn main() {
             // zero page
             &[0x65, addr, ..] => {
                 debug!("adc: add with carry (zero page) 0x{:02x}", addr);
-                let value_to_add = memory[addr as usize] as u16;
+                let value_to_add = memory[addr as u16] as u16;
                 let result = (a as u16) + value_to_add + carry as u16;
 
                 let a_prev = a;
@@ -420,10 +501,10 @@ fn main() {
             // zero page
             &[0x46, addr, ..] => {
                 debug!("lsr: logical shift right (zero page) 0x{:02x}", addr);
-                carry = memory[addr as usize] & 1 != 0;
-                memory[addr as usize] >>= 1;
-                zero = memory[addr as usize] == 0;
-                negative = memory[addr as usize] & (1 << 7) != 0;
+                carry = memory[addr as u16] & 1 != 0;
+                memory.set(addr as u16, memory[addr as u16] >> 1);
+                zero = memory[addr as u16] == 0;
+                negative = memory[addr as u16] & (1 << 7) != 0;
                 pc += 2;
             }
 
@@ -441,7 +522,7 @@ fn main() {
             // zero page
             &[0x05, addr, ..] => {
                 debug!("ora: or with accumulator (zero page) 0x{:02x}", addr);
-                a |= memory[addr as usize];
+                a |= memory[addr as u16];
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
                 pc += 2;
@@ -462,7 +543,7 @@ fn main() {
 
             _ => panic!(
                 "unhandled cpu code: 0x{:02x} ({:?})",
-                &memory[pc as usize], &memory[pc as usize]
+                &memory[pc as u16], &memory[pc as u16]
             ),
         }
     }
@@ -484,12 +565,12 @@ fn push_u16(memory: &mut [u8], sp: &mut u8, val: u16) {
     *sp -= 1;
 }
 
-fn pop_u8(memory: &mut Vec<u8>, sp: &mut u8) -> u8 {
+fn pop_u8(memory: &mut [u8], sp: &mut u8) -> u8 {
     *sp += 1;
     memory[stack_addr(*sp) as usize]
 }
 
-fn push_u8(memory: &mut Vec<u8>, sp: &mut u8, val: u8) {
+fn push_u8(memory: &mut [u8], sp: &mut u8, val: u8) {
     memory[stack_addr(*sp) as usize] = val;
     *sp -= 1;
 }
