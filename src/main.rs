@@ -17,24 +17,155 @@ macro_rules! debug {
     };
 }
 
+/// Each sub-array is the 8-step waveform for a given duty setting.
+///  0 -> 12.5%  (0,1,0,0,0,0,0,0)
+///  1 -> 25%    (0,1,1,0,0,0,0,0)
+///  2 -> 50%    (0,1,1,1,1,0,0,0)
+///  3 -> 25%neg (1,0,0,1,1,1,1,1)
+static DUTY_TABLE: [[u8; 8]; 4] = [
+    [0, 1, 0, 0, 0, 0, 0, 0],
+    [0, 1, 1, 0, 0, 0, 0, 0],
+    [0, 1, 1, 1, 1, 0, 0, 0],
+    [1, 0, 0, 1, 1, 1, 1, 1],
+];
+
+struct PulseChannel {
+    enabled: bool,
+
+    timer: u16,
+    length_counter: u8,
+
+    duty_index: u8,
+    length_counter_disable: bool,
+    envelope_disable: bool,
+    volume_envelope_period: u8,
+}
+
+impl PulseChannel {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            timer: 0,
+            length_counter: 0,
+
+            duty_index: 0,
+            length_counter_disable: false,
+            envelope_disable: false,
+            volume_envelope_period: 0,
+        }
+    }
+}
+
+struct TriangleChannel {
+    enabled: bool,
+
+    timer: u16,
+    length_counter: u8,
+
+    length_counter_halt: bool,
+    linear_counter_reload: u8,
+}
+
+impl TriangleChannel {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            timer: 0,
+            length_counter: 0,
+            length_counter_halt: false,
+            linear_counter_reload: 0,
+        }
+    }
+}
+
+static NOISE_PERIOD_TABLE_NTSC: [u16; 16] = [
+    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+];
+
+/// These values correspond to the 5-bit length index (0..31).
+/// The hardware does this lookup internally on writes to the length registers.
+static LENGTH_TABLE: [u8; 32] = [
+    10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 28, 18, 24, 20, 48, 22,
+    96, 24, 192, 26, 72, 28, 160, 30,
+];
+
+struct NoiseChannel {
+    enabled: bool,
+
+    length_counter_halt: bool,
+    constant_volume: bool,
+    envelope_period: u8,
+
+    short_mode: bool,
+    period_index: u8,
+
+    length_index: u8,
+}
+
+impl NoiseChannel {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            length_counter_halt: false,
+            constant_volume: false,
+            envelope_period: 0,
+            short_mode: false,
+            period_index: 0,
+            length_index: 0,
+        }
+    }
+}
+
+struct APU {
+    pulse_channel_1: PulseChannel,
+    pulse_channel_2: PulseChannel,
+    triangle_channel: TriangleChannel,
+
+    noise_channel: NoiseChannel,
+    dmc_enabled: bool,
+}
+
+impl APU {
+    fn new() -> Self {
+        Self {
+            pulse_channel_1: PulseChannel::new(),
+            pulse_channel_2: PulseChannel::new(),
+            triangle_channel: TriangleChannel::new(),
+
+            // noise_enabled: false,
+            noise_channel: NoiseChannel::new(),
+            dmc_enabled: false,
+        }
+    }
+}
+
 struct MappedMemory {
+    apu: APU,
     memory: [u8; 65536],
 }
 
+const BANKSWITCH_RANGES: std::ops::RangeInclusive<u16> = 0x5FF8..=0x5FFF;
+
 impl MappedMemory {
     fn new() -> Self {
-        Self { memory: [0; 65536] }
+        Self {
+            memory: [0; 65536],
+            apu: APU::new(),
+        }
     }
 
     fn get(&self, index: u16) -> &u8 {
         // APU ranges
         // $4000–$4013, $4015–$4017
-
         let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
         for apu_range in apu_ranges {
             if apu_range.contains(&index) {
                 panic!("APU range read: 0x{:04x}", index);
             }
+        }
+
+        if BANKSWITCH_RANGES.contains(&index) {
+            panic!("bankswitch range read: 0x{:04x}", index);
         }
 
         &self.memory[index as usize]
@@ -48,6 +179,13 @@ impl MappedMemory {
             }
         }
 
+        if BANKSWITCH_RANGES.contains(&index.start) || BANKSWITCH_RANGES.contains(&index.end) {
+            panic!(
+                "bankswitch range read: 0x{:04x}..0x{:04x}",
+                index.start, index.end
+            );
+        }
+
         &self.memory[index.start as usize..index.end as usize]
     }
 
@@ -59,18 +197,129 @@ impl MappedMemory {
             }
         }
 
+        if BANKSWITCH_RANGES.contains(&index.start) {
+            panic!("bankswitch range read: 0x{:04x}..", index.start);
+        }
+
         &self.memory[index.start as usize..]
     }
 
     fn set(&mut self, index: u16, value: u8) {
-        let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
-        for apu_range in apu_ranges {
-            if apu_range.contains(&index) {
-                panic!("APU range write: 0x{:04x} = 0x{:02x}", index, value);
+        match index {
+            0x4000 => {
+                debug!("pulse channel 1 control: 0x{:02x}", value);
+                self.apu.pulse_channel_1.duty_index = (value >> 6) & 0b11; // 0..3
+                self.apu.pulse_channel_1.length_counter_disable = (value & 0b0010_0000) != 0;
+                self.apu.pulse_channel_1.envelope_disable = (value & 0b0001_0000) != 0;
+                self.apu.pulse_channel_1.volume_envelope_period = value & 0b0000_1111;
+            }
+            0x4002 => {
+                debug!("pulse channel 1 timer low: 0x{:02x}", value);
+                self.apu.pulse_channel_1.timer =
+                    (self.apu.pulse_channel_1.timer & 0xFF00) | (value as u16);
+            }
+            0x4003 => {
+                debug!("pulse channel 1 timer high + counter: 0x{:02x}", value);
+                let timer_high_3 = (value & 0b0000_0111) as u16; // lower 3 bits
+                let length_counter_5 = (value >> 3) & 0b0001_1111; // upper 5 bits
+
+                self.apu.pulse_channel_1.timer =
+                    (self.apu.pulse_channel_1.timer & 0x00FF) | (timer_high_3 << 8);
+
+                self.apu.pulse_channel_1.length_counter = length_counter_5;
+            }
+            0x4004 => {
+                debug!("pulse channel 2 control: 0x{:02x}", value);
+                self.apu.pulse_channel_2.duty_index = (value >> 6) & 0b11; // 0..3
+                self.apu.pulse_channel_2.length_counter_disable = (value & 0b0010_0000) != 0;
+                self.apu.pulse_channel_2.envelope_disable = (value & 0b0001_0000) != 0;
+                self.apu.pulse_channel_2.volume_envelope_period = value & 0b0000_1111;
+            }
+            0x4006 => {
+                debug!("pulse channel 2 timer low: 0x{:02x}", value);
+                self.apu.pulse_channel_2.timer =
+                    (self.apu.pulse_channel_2.timer & 0xFF00) | (value as u16);
+            }
+            0x4007 => {
+                debug!("pulse channel 2 timer high + counter: 0x{:02x}", value);
+                let timer_high_3 = (value & 0b0000_0111) as u16; // lower 3 bits
+                let length_counter_5 = (value >> 3) & 0b0001_1111; // upper 5 bits
+
+                self.apu.pulse_channel_2.timer =
+                    (self.apu.pulse_channel_2.timer & 0x00FF) | (timer_high_3 << 8);
+
+                self.apu.pulse_channel_2.length_counter = length_counter_5;
+            }
+            0x4008 => {
+                debug!("triangle channel control: 0x{:02x}", value);
+                // bit 7
+                self.apu.triangle_channel.length_counter_halt = (value & 0b1000_0000) != 0;
+                // bits 0..6
+                self.apu.triangle_channel.linear_counter_reload = value & 0b0111_1111;
+            }
+            0x400a => {
+                debug!("triangle channel timer low: 0x{:02x}", value);
+                self.apu.triangle_channel.timer =
+                    (self.apu.triangle_channel.timer & 0xFF00) | (value as u16);
+            }
+            0x400b => {
+                debug!("triangle channel timer high + counter: 0x{:02x}", value);
+                let timer_high_3 = (value & 0b0000_0111) as u16; // lower 3 bits
+                let length_counter_5 = (value >> 3) & 0b0001_1111; // upper 5 bits
+
+                self.apu.triangle_channel.timer =
+                    (self.apu.triangle_channel.timer & 0x00FF) | (timer_high_3 << 8);
+
+                self.apu.triangle_channel.length_counter = length_counter_5;
+            }
+            0x400C => {
+                self.apu.noise_channel.length_counter_halt = (value & 0x80) != 0; // bit 7
+                self.apu.noise_channel.constant_volume = (value & 0x40) != 0; // bit 6
+                self.apu.noise_channel.envelope_period = value & 0x0F; // bits 3..0
+
+                // Bits 5..4 get ignored by the hardware
+            }
+            0x400E => {
+                debug!("noise period/mode: 0x{:02x}", value);
+                // bit 7
+                self.apu.noise_channel.short_mode = (value & 0b1000_0000) != 0;
+                // bits 3..0
+                self.apu.noise_channel.period_index = value & 0b0000_1111;
+
+                // bits 6..4 are ignored
+            }
+            0x400F => {
+                debug!("noise channel length load: 0x{:02x}", value);
+
+                // Bits 7..3 = length counter index
+                let length_val = (value >> 3) & 0b1_1111;
+                self.apu.noise_channel.length_index = length_val;
+
+                // Bits 2..0 are unused for noise
+                // If you implement the envelope fully, you also reset the envelope here.
+            }
+            0x4015 => {
+                debug!("APU status: 0x{:02x}", value);
+                self.apu.pulse_channel_1.enabled = (value & 0b0000_0001) != 0;
+                self.apu.pulse_channel_2.enabled = (value & 0b0000_0010) != 0;
+                self.apu.triangle_channel.enabled = (value & 0b0000_0100) != 0;
+                self.apu.noise_channel.enabled = (value & 0b0000_1000) != 0;
+                self.apu.dmc_enabled = (value & 0b0001_0000) != 0;
+                // bits 5..=7 are unused
+            }
+            _ => {
+                let apu_ranges = [0x4000..=0x4013, 0x4015..=0x4017];
+                for apu_range in apu_ranges {
+                    if apu_range.contains(&index) {
+                        panic!("APU range write: 0x{:04x} = 0x{:02x}", index, value);
+                    }
+                }
+                if BANKSWITCH_RANGES.contains(&index) {
+                    panic!("bankswitch range write: 0x{:04x} = 0x{:02x}", index, value);
+                }
+                self.memory[index as usize] = value;
             }
         }
-
-        self.memory[index as usize] = value;
     }
 }
 
@@ -276,7 +525,14 @@ fn main() {
             &[0xbd, lo, hi, ..] => {
                 debug!("lda: load a (absolute +x) 0x{:02x}{:02x}", hi, lo);
                 let addr = u16::from_le_bytes([lo, hi]);
-                a = memory[(addr + x as u16)];
+                a = memory[addr + x as u16];
+                pc += 3;
+            }
+            // absolute +y
+            &[0xb9, lo, hi, ..] => {
+                debug!("lda: load a (absolute +y) 0x{:02x}{:02x}", hi, lo);
+                let addr = u16::from_le_bytes([lo, hi]);
+                a = memory[addr + y as u16];
                 pc += 3;
             }
             // indirect +y
@@ -287,11 +543,19 @@ fn main() {
                 a = memory[addr + y as u16];
                 pc += 2;
             }
+            // indirect +x
+            &[0xa1, addr, ..] => {
+                debug!("lda: load a (indirect +x) 0x{:02x}", addr);
+                let addr =
+                    u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
+                a = memory[addr + x as u16];
+                pc += 2;
+            }
 
             // sta: store a
-            // absolute
+            // zero page
             &[0x85, lo, ..] => {
-                debug!("sta: store a (absolute) 0x{:02x}", lo);
+                debug!("sta: store a (zero page) 0x{:02x}", lo);
                 memory.set(lo as u16, a);
                 pc += 2;
             }
@@ -304,7 +568,7 @@ fn main() {
             }
             // absolute +x
             &[0x9d, lo, hi, ..] => {
-                debug!("sta: store a (absolute +x) 0x{:02x}{:02x}", hi, lo);
+                debug!("sta: store a (absolute +x) 0x{hi:02x}{lo:02x} + {x:02x}");
                 let addr = u16::from_le_bytes([lo, hi]);
                 memory.set(addr + x as u16, a);
                 pc += 3;
@@ -351,6 +615,33 @@ fn main() {
                 pc += 1;
             }
 
+            // txa: transfer x to a
+            &[0x8a, ..] => {
+                debug!("txa: transfer x to a");
+                a = x;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // tay: transfer a to y
+            &[0xa8, ..] => {
+                debug!("tay: transfer a to y");
+                y = a;
+                zero = y == 0;
+                negative = y & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // tya: transfer y to a
+            &[0x98, ..] => {
+                debug!("tya: transfer y to a");
+                a = y;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
+            }
+
             // ldy: load y
             // immediate
             &[0xa0, val, ..] => {
@@ -358,6 +649,12 @@ fn main() {
                 y = val;
                 zero = y == 0;
                 negative = y & (1 << 7) != 0;
+                pc += 2;
+            }
+            // zero page
+            &[0xa4, addr, ..] => {
+                debug!("ldy: load y (zero page) 0x{:02x}", addr);
+                y = memory[addr as u16];
                 pc += 2;
             }
 
@@ -374,6 +671,21 @@ fn main() {
             &[0x4c, lo, hi, ..] => {
                 debug!("jmp: jump to 0x{:02x}{:02x}", hi, lo);
                 pc = u16::from_le_bytes([lo, hi]);
+            }
+            // indirect
+            &[0x6c, lo, hi, ..] => {
+                debug!("jmp: jump to 0x{:02x}{:02x} (indirect)", hi, lo);
+                let addr = u16::from_le_bytes([lo, hi]);
+                let low_byte = *memory.get(addr);
+                // Emulate CPU bug:
+                // If the low byte of the address is 0xFF, the high byte is read from the beginning of the same page.
+                let high_addr = if addr & 0x00FF == 0x00FF {
+                    addr & 0xFF00 // wraps around to the same page
+                } else {
+                    addr + 1
+                };
+                let high_byte = *memory.get(high_addr);
+                pc = u16::from_le_bytes([low_byte, high_byte]);
             }
 
             // beq: branch if equal
@@ -420,6 +732,28 @@ fn main() {
                 }
             }
 
+            // bpl: branch if plus (relative)
+            &[0x10, offset, ..] => {
+                debug!("bpl: branch if plus (relative)");
+                if !negative {
+                    let offset = i8::from_le_bytes([offset]);
+                    pc = pc.wrapping_add_signed(2 + offset as i16);
+                } else {
+                    pc += 2;
+                }
+            }
+
+            // bmi: branch if minus (relative)
+            &[0x30, offset, ..] => {
+                debug!("bmi: branch if minus (relative)");
+                if negative {
+                    let offset = i8::from_le_bytes([offset]);
+                    pc = pc.wrapping_add_signed(2 + offset as i16);
+                } else {
+                    pc += 2;
+                }
+            }
+
             // cmp
             // immediate
             &[0xc9, val, ..] => {
@@ -427,6 +761,26 @@ fn main() {
                 carry = a >= val;
                 zero = a == val;
                 let result = a.wrapping_sub(val);
+                negative = result & (1 << 7) != 0;
+                pc += 2;
+            }
+            // zero page
+            &[0xc5, addr, ..] => {
+                debug!("cmp: compare (zero page) 0x{:02x}", addr);
+                carry = a >= memory[addr as u16];
+                zero = a == memory[addr as u16];
+                let result = a.wrapping_sub(memory[addr as u16]);
+                negative = result & (1 << 7) != 0;
+                pc += 2;
+            }
+            // indirect +y
+            &[0xd1, addr, ..] => {
+                debug!("cmp: compare (indirect +y) 0x{:02x}", addr);
+                let addr =
+                    u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
+                carry = a >= memory[addr + y as u16];
+                zero = a == memory[addr + y as u16];
+                let result = a.wrapping_sub(memory[addr + y as u16]);
                 negative = result & (1 << 7) != 0;
                 pc += 2;
             }
@@ -452,6 +806,15 @@ fn main() {
                 negative = result & (1 << 7) != 0;
                 pc += 2;
             }
+            // zero page
+            &[0xc4, addr, ..] => {
+                debug!("cpy: compare y (zero page) 0x{:02x}", addr);
+                carry = y >= memory[addr as u16];
+                zero = y == memory[addr as u16];
+                let result = y.wrapping_sub(memory[addr as u16]);
+                negative = result & (1 << 7) != 0;
+                pc += 2;
+            }
 
             // dec: decrement memory
             // zero page
@@ -472,6 +835,15 @@ fn main() {
                 pc += 1;
             }
 
+            // dex: decrement x
+            &[0xca, ..] => {
+                debug!("dex: decrement x");
+                x = x.wrapping_sub(1);
+                zero = x == 0;
+                negative = x & (1 << 7) != 0;
+                pc += 1;
+            }
+
             // inc: increment memory
             // zero page
             &[0xe6, addr, ..] => {
@@ -480,6 +852,15 @@ fn main() {
                 zero = memory[addr as u16] == 0;
                 negative = memory[addr as u16] & (1 << 7) != 0;
                 pc += 2;
+            }
+            // absolute
+            &[0xee, lo, hi, ..] => {
+                debug!("inc: increment memory (absolute) 0x{:02x}{:02x}", hi, lo);
+                let addr = u16::from_le_bytes([lo, hi]);
+                memory.set(addr, memory[addr].wrapping_add(1));
+                zero = memory[addr] == 0;
+                negative = memory[addr] & (1 << 7) != 0;
+                pc += 3;
             }
 
             // inx: increment x
@@ -501,11 +882,13 @@ fn main() {
             }
 
             // adc: add with carry
-            // zero page
-            &[0x65, addr, ..] => {
-                debug!("adc: add with carry (zero page) 0x{:02x}", addr);
-                let value_to_add = memory[addr as u16] as u16;
-                let result = (a as u16) + value_to_add + carry as u16;
+            // immediate
+            &[0x69, val, ..] => {
+                debug!("adc: add with carry (immediate) 0x{:02x}", val);
+                let value_to_add = val as u16;
+                let result = (a as u16)
+                    .wrapping_add(value_to_add)
+                    .wrapping_add(carry as u16);
 
                 let a_prev = a;
                 a = result as u8;
@@ -513,7 +896,24 @@ fn main() {
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
                 // "If the result's sign is different from both A's and memory's, signed overflow (or underflow) occurred."
-                overflow = ((a_prev ^ a) & (a_prev ^ value_to_add as u8) & 0x80) != 0;
+                overflow = ((a_prev ^ a) & ((value_to_add as u8) ^ a) & 0x80) != 0;
+                pc += 2;
+            }
+            // zero page
+            &[0x65, addr, ..] => {
+                debug!("adc: add with carry (zero page) 0x{:02x}", addr);
+                let value_to_add = memory[addr as u16] as u16;
+                let result = (a as u16)
+                    .wrapping_add(value_to_add)
+                    .wrapping_add(carry as u16);
+
+                let a_prev = a;
+                a = result as u8;
+                carry = result > 0xFF;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                // "If the result's sign is different from both A's and memory's, signed overflow (or underflow) occurred."
+                overflow = ((a_prev ^ a) & ((value_to_add as u8) ^ a) & 0x80) != 0;
                 pc += 2;
             }
             // indirect +y
@@ -522,6 +922,24 @@ fn main() {
                 let addr =
                     u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
                 let value_to_add = memory[addr + y as u16] as u16;
+                let result = (a as u16)
+                    .wrapping_add(value_to_add)
+                    .wrapping_add(carry as u16);
+
+                let a_prev = a;
+                a = result as u8;
+                carry = result > 0xFF;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                // "If the result's sign is different from both A's and memory's, signed overflow (or underflow) occurred."
+                overflow = ((a_prev ^ a) & ((value_to_add as u8) ^ a) & 0x80) != 0;
+                pc += 2;
+            }
+            // absolute
+            &[0x6d, lo, hi, ..] => {
+                debug!("adc: add with carry (absolute) 0x{:02x}{:02x}", hi, lo);
+                let addr = u16::from_le_bytes([lo, hi]);
+                let value_to_add = memory[addr] as u16;
                 let result = (a as u16) + value_to_add + carry as u16;
 
                 let a_prev = a;
@@ -530,7 +948,69 @@ fn main() {
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
                 // "If the result's sign is different from both A's and memory's, signed overflow (or underflow) occurred."
-                overflow = ((a_prev ^ a) & (a_prev ^ value_to_add as u8) & 0x80) != 0;
+                overflow = ((a_prev ^ a) & ((value_to_add as u8) ^ a) & 0x80) != 0;
+                pc += 3;
+            }
+
+            // sbc: subtract with carry
+            // immediate
+            &[0xe9, val, ..] => {
+                debug!("sbc: subtract with carry (immediate) 0x{:02x}", val);
+
+                let a_prev = a;
+
+                // Perform the actual subtraction in 16 bits
+                let result = (a as u16)
+                    .wrapping_sub(val as u16)
+                    .wrapping_sub(!carry as u16);
+
+                // Store the 8-bit result
+                a = result as u8;
+
+                // Carry is set if the result didn't require a borrow
+                carry = result <= 0xFF;
+
+                // Standard flags
+                zero = a == 0;
+                negative = (a & 0x80) != 0;
+
+                // --- Correct overflow calculation ---
+                // Even though we "subtracted," internally the CPU does A + (~val) + carry.
+                // So the effective 8-bit operand is:
+                let operand_8 = (!val).wrapping_add(carry as u8);
+                // Now use the standard 6502 overflow formula:
+                overflow = ((a_prev ^ a) & (operand_8 ^ a) & 0x80) != 0;
+
+                pc += 2;
+            }
+            // zero page
+            &[0xe5, addr, ..] => {
+                debug!("sbc: subtract with carry (zero page) 0x{:02x}", addr);
+
+                let a_prev = a;
+
+                // Perform the actual subtraction in 16 bits
+                let result = (a as u16)
+                    .wrapping_sub(memory[addr as u16] as u16)
+                    .wrapping_sub(!carry as u16);
+
+                // Store the 8-bit result
+                a = result as u8;
+
+                // Carry is set if the result didn't require a borrow
+                carry = result <= 0xFF;
+
+                // Standard flags
+                zero = a == 0;
+                negative = (a & 0x80) != 0;
+
+                // --- Correct overflow calculation ---
+                // Even though we "subtracted," internally the CPU does A + (~val) + carry.
+                // So the effective 8-bit operand is:
+                let operand_8 = (!memory[addr as u16]).wrapping_add(carry as u8);
+                // Now use the standard 6502 overflow formula:
+                overflow = ((a_prev ^ a) & (operand_8 ^ a) & 0x80) != 0;
+
                 pc += 2;
             }
 
@@ -544,6 +1024,15 @@ fn main() {
                 negative = a & (1 << 7) != 0;
                 pc += 1;
             }
+            // zero page
+            &[0x46, addr, ..] => {
+                debug!("lsr: logical shift right (zero page) 0x{:02x}", addr);
+                carry = memory[addr as u16] & 1 != 0;
+                memory.set(addr as u16, memory[addr as u16] >> 1);
+                zero = memory[addr as u16] == 0;
+                negative = memory[addr as u16] & (1 << 7) != 0;
+                pc += 2;
+            }
 
             // asl: arithmetic shift left
             // accumulator
@@ -556,14 +1045,30 @@ fn main() {
                 pc += 1;
             }
 
-            // zero page
-            &[0x46, addr, ..] => {
-                debug!("lsr: logical shift right (zero page) 0x{:02x}", addr);
-                carry = memory[addr as u16] & 1 != 0;
-                memory.set(addr as u16, memory[addr as u16] >> 1);
-                zero = memory[addr as u16] == 0;
-                negative = memory[addr as u16] & (1 << 7) != 0;
-                pc += 2;
+            // rol: rotate left
+            // ROL shifts a memory value or the accumulator to the left, moving the value of each bit into the next bit and treating the carry flag as though it is both above bit 7 and below bit 0. Specifically, the value in carry is shifted into bit 0, and bit 7 is shifted into carry. Rotating left 9 times simply returns the value and carry back to their original state.
+            // accumulator
+            &[0x2a, ..] => {
+                debug!("rol: rotate left (accumulator)");
+                let carry_bit = carry as u8;
+                carry = a & (1 << 7) != 0;
+                a = (a << 1) | carry_bit;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
+            }
+
+            // ror: rotate right
+            // ROR shifts a memory value or the accumulator to the right, moving the value of each bit into the next bit and treating the carry flag as though it is both above bit 7 and below bit 0. Specifically, the value in carry is shifted into bit 7, and bit 0 is shifted into carry. Rotating right 9 times simply returns the value and carry back to their original state.
+            // accumulator
+            &[0x6a, ..] => {
+                debug!("ror: rotate right (accumulator)");
+                let carry_bit = carry as u8;
+                carry = a & 1 != 0;
+                a = (a >> 1) | (carry_bit << 7);
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 1;
             }
 
             // and
@@ -577,6 +1082,14 @@ fn main() {
             }
 
             // ora: or with accumulator
+            // immediate
+            &[0x09, val, ..] => {
+                debug!("ora: or with accumulator (immediate) 0x{:02x}", val);
+                a |= val;
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 2;
+            }
             // zero page
             &[0x05, addr, ..] => {
                 debug!("ora: or with accumulator (zero page) 0x{:02x}", addr);
@@ -584,6 +1097,23 @@ fn main() {
                 zero = a == 0;
                 negative = a & (1 << 7) != 0;
                 pc += 2;
+            }
+            // indirect +y
+            &[0x11, addr, ..] => {
+                debug!("ora: or with accumulator (indirect +y) 0x{:02x}", addr);
+                let addr =
+                    u16::from_le_bytes([memory[addr as u16], memory[addr.wrapping_add(1) as u16]]);
+                a |= memory[addr + y as u16];
+                zero = a == 0;
+                negative = a & (1 << 7) != 0;
+                pc += 2;
+            }
+
+            // sec: set carry
+            &[0x38, ..] => {
+                debug!("sec: set carry");
+                carry = true;
+                pc += 1;
             }
 
             // clc: clear carry
