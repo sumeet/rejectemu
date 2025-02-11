@@ -59,13 +59,17 @@ impl PulseChannel {
 }
 
 struct TriangleChannel {
+    // CPU-exposed register fields
     enabled: bool,
-
     timer: u16,
     length_counter: u8,
-
     length_counter_halt: bool,
     linear_counter_reload: u8,
+
+    // Internal APU state
+    sequence_step: u8,  // current step 0..31
+    timer_counter: u16, // counts down from (timer + 1)
+    linear_counter: u8, // actual current linear counter
 }
 
 impl TriangleChannel {
@@ -76,17 +80,41 @@ impl TriangleChannel {
             length_counter: 0,
             length_counter_halt: false,
             linear_counter_reload: 0,
+
+            sequence_step: 0,
+            timer_counter: 0,
+            linear_counter: 0,
         }
     }
 
-    fn step(&mut self) {}
+    fn step(&mut self) {
+        if self.timer_counter == 0 {
+            // Reset timer
+            self.timer_counter = self.timer.wrapping_add(1);
+            // Advance the triangle sequence
+            self.sequence_step = (self.sequence_step + 1) % 32;
+        } else {
+            self.timer_counter -= 1;
+        }
+    }
 
     fn amplitude(&self) -> f32 {
         if !self.enabled {
             return 0.0;
         }
 
-        10.0
+        // ignoring these for now, because frame stepper isn't implemented (whatever that means)
+        //
+        // if self.length_counter == 0 || self.linear_counter == 0 {
+        //     return 0.0;
+        // }
+
+        // The 32-step triangle pattern: 0..15 ascending, 16..31 descending
+        let step = self.sequence_step;
+        let amplitude_u8 = if step < 16 { step } else { 31 - step };
+
+        // Scale to a float for mixing: for a quick test, just map 0..15 to 0..1 or 0..some max
+        amplitude_u8 as f32 / 15.0
     }
 }
 
@@ -295,6 +323,15 @@ impl MappedMemory {
                     (self.apu.triangle_channel.timer & 0x00FF) | (timer_high_3 << 8);
 
                 self.apu.triangle_channel.length_counter = length_counter_5;
+
+                // Reset the triangle sequencer phase to 0 if length_counter is nonzero
+                if self.apu.triangle_channel.length_counter > 0 {
+                    self.apu.triangle_channel.sequence_step = 0;
+                }
+
+                // Possibly also handle an immediate linear counter reload if `length_counter_halt` is set
+                // (depends on how accurately you want to emulate right now)
+                // IDK this means TODO lol
             }
             0x400C => {
                 debug!("APU: noise channel control: 0x{:02x}", value);
@@ -1168,8 +1205,8 @@ fn main() {
         // could generate audio here... (i know timing will be wrong but it could work)
         memory.apu.step();
         samples.push(memory.apu.amplitude());
-        if (samples.len() == samples.capacity()) {
-            let bf = SamplesBuffer::new(1, 44100, samples.clone());
+        if samples.len() == samples.capacity() {
+            let bf = SamplesBuffer::new(1, 44100 / 4, samples.clone());
             stream_handle.play_raw(bf).unwrap();
             samples.clear();
         }
