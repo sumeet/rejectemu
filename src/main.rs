@@ -1,3 +1,5 @@
+use rodio::buffer::SamplesBuffer;
+use rodio::OutputStream;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::Read;
@@ -76,6 +78,16 @@ impl TriangleChannel {
             linear_counter_reload: 0,
         }
     }
+
+    fn step(&mut self) {}
+
+    fn amplitude(&self) -> f32 {
+        if !self.enabled {
+            return 0.0;
+        }
+
+        10.0
+    }
 }
 
 static NOISE_PERIOD_TABLE_NTSC: [u16; 16] = [
@@ -136,6 +148,15 @@ impl APU {
             noise_channel: NoiseChannel::new(),
             dmc_enabled: false,
         }
+    }
+
+    fn step(&mut self) {
+        self.triangle_channel.step();
+    }
+
+    fn amplitude(&self) -> f32 {
+        // only handling triangle channel so far
+        self.triangle_channel.amplitude()
     }
 }
 
@@ -207,19 +228,19 @@ impl MappedMemory {
     fn set(&mut self, index: u16, value: u8) {
         match index {
             0x4000 => {
-                debug!("pulse channel 1 control: 0x{:02x}", value);
+                debug!("APU: pulse channel 1 control: 0x{:02x}", value);
                 self.apu.pulse_channel_1.duty_index = (value >> 6) & 0b11; // 0..3
                 self.apu.pulse_channel_1.length_counter_disable = (value & 0b0010_0000) != 0;
                 self.apu.pulse_channel_1.envelope_disable = (value & 0b0001_0000) != 0;
                 self.apu.pulse_channel_1.volume_envelope_period = value & 0b0000_1111;
             }
             0x4002 => {
-                debug!("pulse channel 1 timer low: 0x{:02x}", value);
+                debug!("APU: pulse channel 1 timer low: 0x{:02x}", value);
                 self.apu.pulse_channel_1.timer =
                     (self.apu.pulse_channel_1.timer & 0xFF00) | (value as u16);
             }
             0x4003 => {
-                debug!("pulse channel 1 timer high + counter: 0x{:02x}", value);
+                debug!("APU: pulse channel 1 timer high + counter: 0x{:02x}", value);
                 let timer_high_3 = (value & 0b0000_0111) as u16; // lower 3 bits
                 let length_counter_5 = (value >> 3) & 0b0001_1111; // upper 5 bits
 
@@ -229,19 +250,19 @@ impl MappedMemory {
                 self.apu.pulse_channel_1.length_counter = length_counter_5;
             }
             0x4004 => {
-                debug!("pulse channel 2 control: 0x{:02x}", value);
+                debug!("APU: pulse channel 2 control: 0x{:02x}", value);
                 self.apu.pulse_channel_2.duty_index = (value >> 6) & 0b11; // 0..3
                 self.apu.pulse_channel_2.length_counter_disable = (value & 0b0010_0000) != 0;
                 self.apu.pulse_channel_2.envelope_disable = (value & 0b0001_0000) != 0;
                 self.apu.pulse_channel_2.volume_envelope_period = value & 0b0000_1111;
             }
             0x4006 => {
-                debug!("pulse channel 2 timer low: 0x{:02x}", value);
+                debug!("APU: pulse channel 2 timer low: 0x{:02x}", value);
                 self.apu.pulse_channel_2.timer =
                     (self.apu.pulse_channel_2.timer & 0xFF00) | (value as u16);
             }
             0x4007 => {
-                debug!("pulse channel 2 timer high + counter: 0x{:02x}", value);
+                debug!("APU: pulse channel 2 timer high + counter: 0x{:02x}", value);
                 let timer_high_3 = (value & 0b0000_0111) as u16; // lower 3 bits
                 let length_counter_5 = (value >> 3) & 0b0001_1111; // upper 5 bits
 
@@ -251,19 +272,22 @@ impl MappedMemory {
                 self.apu.pulse_channel_2.length_counter = length_counter_5;
             }
             0x4008 => {
-                debug!("triangle channel control: 0x{:02x}", value);
+                debug!("APU: triangle channel control: 0x{:02x}", value);
                 // bit 7
                 self.apu.triangle_channel.length_counter_halt = (value & 0b1000_0000) != 0;
                 // bits 0..6
                 self.apu.triangle_channel.linear_counter_reload = value & 0b0111_1111;
             }
             0x400a => {
-                debug!("triangle channel timer low: 0x{:02x}", value);
+                debug!("APU: triangle channel timer low: 0x{:02x}", value);
                 self.apu.triangle_channel.timer =
                     (self.apu.triangle_channel.timer & 0xFF00) | (value as u16);
             }
             0x400b => {
-                debug!("triangle channel timer high + counter: 0x{:02x}", value);
+                debug!(
+                    "APU: triangle channel timer high + counter: 0x{:02x}",
+                    value
+                );
                 let timer_high_3 = (value & 0b0000_0111) as u16; // lower 3 bits
                 let length_counter_5 = (value >> 3) & 0b0001_1111; // upper 5 bits
 
@@ -273,6 +297,7 @@ impl MappedMemory {
                 self.apu.triangle_channel.length_counter = length_counter_5;
             }
             0x400C => {
+                debug!("APU: noise channel control: 0x{:02x}", value);
                 self.apu.noise_channel.length_counter_halt = (value & 0x80) != 0; // bit 7
                 self.apu.noise_channel.constant_volume = (value & 0x40) != 0; // bit 6
                 self.apu.noise_channel.envelope_period = value & 0x0F; // bits 3..0
@@ -280,7 +305,7 @@ impl MappedMemory {
                 // Bits 5..4 get ignored by the hardware
             }
             0x400E => {
-                debug!("noise period/mode: 0x{:02x}", value);
+                debug!("APU: noise period/mode: 0x{:02x}", value);
                 // bit 7
                 self.apu.noise_channel.short_mode = (value & 0b1000_0000) != 0;
                 // bits 3..0
@@ -289,7 +314,7 @@ impl MappedMemory {
                 // bits 6..4 are ignored
             }
             0x400F => {
-                debug!("noise channel length load: 0x{:02x}", value);
+                debug!("APU: noise channel length load: 0x{:02x}", value);
 
                 // Bits 7..3 = length counter index
                 let length_val = (value >> 3) & 0b1_1111;
@@ -299,7 +324,7 @@ impl MappedMemory {
                 // If you implement the envelope fully, you also reset the envelope here.
             }
             0x4015 => {
-                debug!("APU status: 0x{:02x}", value);
+                debug!("APU: status: 0x{:02x}", value);
                 self.apu.pulse_channel_1.enabled = (value & 0b0000_0001) != 0;
                 self.apu.pulse_channel_2.enabled = (value & 0b0000_0010) != 0;
                 self.apu.triangle_channel.enabled = (value & 0b0000_0100) != 0;
@@ -454,6 +479,11 @@ fn main() {
 
     let mut is_done_with_init = false;
     let mut is_init_just_finished = false;
+
+    // this is for audio
+    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+    let mut samples = Vec::with_capacity(512);
+    // end of this is for audio
 
     loop {
         if is_init_just_finished {
@@ -1133,6 +1163,15 @@ fn main() {
                 "unhandled cpu code: 0x{:02x} ({:?})",
                 &memory[pc as u16], &memory[pc as u16]
             ),
+        }
+
+        // could generate audio here... (i know timing will be wrong but it could work)
+        memory.apu.step();
+        samples.push(memory.apu.amplitude());
+        if (samples.len() == samples.capacity()) {
+            let bf = SamplesBuffer::new(1, 44100, samples.clone());
+            stream_handle.play_raw(bf).unwrap();
+            samples.clear();
         }
     }
 }
